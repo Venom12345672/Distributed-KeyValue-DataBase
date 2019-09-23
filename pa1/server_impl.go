@@ -16,6 +16,7 @@ type keyValueServer struct {
 	socketList []net.Conn
 	read chan string
 	write chan string
+	criticalState chan bool
 
 }
 
@@ -25,6 +26,7 @@ func New() KeyValueServer {
 	//server.totalConnections = 0
 	//server .socketList = []bufio.ReadWriter{}
 	server.read = make(chan string)
+	server.criticalState = make(chan bool)
 	server.write = make(chan string)
 	return server
 }
@@ -49,6 +51,7 @@ func (kvs *keyValueServer) StartModel1(port int) error {
 			kvs.socketList = append(kvs.socketList,conn)
 			kvs.totalConnections++
 			//fmt.Println("Client",kvs.totalConnections ,"has been connected...")
+			
 			// handle successful connections concurrently
 			if err != nil {
 				fmt.Printf("Couldn't accept a client connection: %s\n", err)
@@ -96,7 +99,7 @@ func (kvs *keyValueServer) RecvPut(args *rpcs.PutArgs, reply *rpcs.PutReply) err
 // TODO: add additional methods/functions below!
 
 // handleConnection handles client connections
-func handleConnection(conn net.Conn,kvs *keyValueServer) {
+func  handleConnection(conn net.Conn,kvs *keyValueServer) {
 	// clean up once the connection closes
 	defer Clean(conn)
 	
@@ -115,30 +118,23 @@ func handleConnection(conn net.Conn,kvs *keyValueServer) {
 
 		// print client message
 		//fmt.Printf("Recieved: '%s' of len %d from client: %v\n", msg[:len(msg)-1], len(msg), conn)
-
+		
 		command,key,value := parsingData(msg)
 		go func() {
 			if(command == "put") {
 				kvs.write <- "Put Command Recieved"
 			} else if (command == "get") {
-				kvs.read <- "Get COmmand Recieved"
+				kvs.read <- "Get Command Recieved"
 			}
 		}()
-	
+		
+		go readWriteDataBase(key,value,kvs)
 
-		go func() {
-			select {
-				case _ = <- kvs.write:
-					put(key,value) // write command
-					fmt.Println("Value Put -> Key: ",key," Value: ",string(value))
-				case _ = <- kvs.read:
-					v := get(key) // read command
-					fmt.Println("Value Get -> Key: ",key," Value: ",string(v))
-					for _,socket := range kvs.socketList {
-						socket.Write([]byte(string(key)+","+string(v)))
-					}
-			}
-		}()
+	
+		
+		
+	
+	
 
 
 		// echo back the same message to the client
@@ -175,7 +171,30 @@ func check(word string) int  {
 	return -1
 }
 
+func readWriteInDataBase(key string,value []byte,kvs *keyValueServer) {
+	select {
+		case _ = <- kvs.write:
+			put(key,value) // write command
+			fmt.Println("Value Put -> Key: ",key," Value: ",string(value))
+		case _ = <- kvs.read:
+			v := get(key) // read command
+			fmt.Println("Value Get -> Key: ",key," Value: ",string(v))
+				for _,socket := range kvs.socketList {
+				socket.Write([]byte(string(key)+","+string(v)))
+			}
+	}
+}
 
+func readWriteToClient() {
+	// get client message
+		msg, err := rw.ReadString('\n')
+		if err != nil {
+			fmt.Printf("There was an error reading from a client connection: %s\n", err)
+			kvs.totalConnections--
+			//fmt.Println("Connected Clients: ",kvs.totalConnections)
+			return
+		}
+}
 func parsingData(msg string) (string,string,[]byte) {
 	
 	var command,key,value string
