@@ -4,13 +4,19 @@ package pa1
 
 import (
 	"DS_PA1/rpcs"
-	// "fmt"
 	"net"
 	"bufio"
 	"strconv"
+	"net/http"
+	"net/rpc"
 )
 
 type keyValueServer struct {
+	put_value_by_key chan rpcs.PutArgs
+	get_by_key chan string
+	get_by_keyX chan []byte
+
+
 	listener net.Listener
 	clientList map[int] *client
 	connectedClients int
@@ -46,7 +52,10 @@ func New() KeyValueServer {
 		countYesNo:    make(chan bool),
 		sendingCount:   make(chan int),
 		deleteClient:           make(chan *client),
-		msgFromClient:              make(chan *node)}
+		msgFromClient:              make(chan *node),
+		put_value_by_key: make(chan rpcs.PutArgs),
+		get_by_key: make(chan string),
+		get_by_keyX: make(chan []byte)}
 
 	initDB()
 	return server
@@ -84,47 +93,53 @@ func (kvs *keyValueServer) Count() int {
 }
 
 func (kvs *keyValueServer) StartModel2(port int) error {
-	
+	done := make(chan error)
 	go func() {
-	// The methods of this class will be made available for RPC access
+		ln, err := net.Listen("tcp", ":" + strconv.Itoa(port))
+		kvs.listener = ln
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+		rpcServer := rpc.NewServer()
+		rpcServer.Register(rpcs.Wrap(kvs))
+		http.DefaultServeMux = http.NewServeMux()
+		rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
+		go db2(kvs)
+		go http.Serve(ln, nil)
 
-	// Attempt to listen on TCP port 9999
-	ln, err := net.Listen("tcp", "localhost:9999")
-
-	// Print error and return if couldn't listen on port 9999
-	if err != nil {
-		fmt.Println("Couldn't listen on port 9999: ", err)
-		return
-	}
-
-	// Instantiate a new RPC server object
-	rpcServer := rpc.NewServer()
-
-	// Register Server class methods for RPC access
-	http.DefaultServeMux = http.NewServeMux()
-	// Register an HTTP handler for the RPC server
-	rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
-
-	// Start a go-routine that listens for RPC calls on the TCP listener ln forever
-	go http.Serve(ln, nil)
-
-	//  code...
-	// Block main forever
-	fmt.Println("RPC server started...")
+		<- kvs.closeServer
+		ln.Close()
 	}()
-	return nil
+
+	e := <- done
+	return e
 }
 
 func (kvs *keyValueServer) RecvGet(args *rpcs.GetArgs, reply *rpcs.GetReply) error {
-	// TODO: implement this!
+	kvs.get_by_key<- args.Key
+	ans := <-kvs.get_by_keyX
+	reply.Value = ans
 	return nil
 }
 
 func (kvs *keyValueServer) RecvPut(args *rpcs.PutArgs, reply *rpcs.PutReply) error {
-	// TODO: implement this!
+	kvs.put_value_by_key <- *args
 	return nil
 }
 
+func db2(kvs* keyValueServer){
+	for{
+		select{
+		case k := <-kvs.get_by_key:
+			ans:= get(k)
+			kvs.get_by_keyX <- ans
+		case p := <-kvs.put_value_by_key:
+			put(p.Key, p.Value)
+		}
+	}
+}
 // TODO: add additional methods/functions below!
 func serverHandlingClients(kvs *keyValueServer) {
 	for {
