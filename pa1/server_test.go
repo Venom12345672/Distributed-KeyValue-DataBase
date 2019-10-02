@@ -72,7 +72,6 @@ func newTestClients(num int, slow bool) []*testClient {
 // startServer attempts to start a server on a random port, retrying up to numTries
 // times if necessary. A non-nil error is returned if the server failed to start.
 func (ts *testSystem) startServer(numTries int, isRPCserver bool) (int, error) {
-
 	randGen := rand.New(rand.NewSource(time.Now().Unix()))
 	var err error
 	for i := 0; i < numTries; i++ {
@@ -355,10 +354,20 @@ func (ts *testSystem) checkCount(expected int) error {
 	return nil
 }
 
-func testRPCSequentially(t *testing.T, name string, numMessages int) {
-	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: 64000, Max: 64000})
+func randomValueGen(length int) []byte {
 	rand.Seed(time.Now().UnixNano())
 	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	value := make([]rune, length)
+	for k := range value {
+		value[k] = letters[rand.Intn(len(letters))]
+	}
+	return []byte(string(value))
+}
+
+func testRPCSequentially(t *testing.T, name string, numMessages int) {
+	valueLength := 8
+
+	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: 64000, Max: 64000})
 	fmt.Printf("========== %s: %d client(s), %d get requests each ==========\n", name, 1, numMessages)
 
 	ts := newTestSystem(t)
@@ -378,14 +387,12 @@ func testRPCSequentially(t *testing.T, name string, numMessages int) {
 
 	fmt.Printf("Calling RecvPut and RecvGet RPC %d times sequentially ...\n", numMessages)
 	for i := 0; i < numMessages; i++ {
+		key := "Test" + strconv.Itoa(i)
+		value := randomValueGen(valueLength)
 		putArgs := new(rpcs.PutArgs)
 		putReply := new(rpcs.PutReply)
-		value := make([]rune, 8)
-		for j := range value {
-			value[j] = letters[rand.Intn(len(letters))]
-		}
-		putArgs.Key = "Test" + strconv.Itoa(i)
-		putArgs.Value = []byte(string(value))
+		putArgs.Key = key
+		putArgs.Value = value
 		err = server.Call("KeyValueServer.RecvPut", putArgs, putReply)
 		if err != nil {
 			t.Errorf("RecvPut RPC call returned an error: %s\n", err)
@@ -394,14 +401,14 @@ func testRPCSequentially(t *testing.T, name string, numMessages int) {
 
 		getArgs := new(rpcs.GetArgs)
 		getReply := new(rpcs.GetReply)
-		getArgs.Key = "Test" + strconv.Itoa(i)
+		getArgs.Key = key
 		err = server.Call("KeyValueServer.RecvGet", getArgs, getReply)
 		if err != nil {
 			t.Errorf("Error making RecvPut RPC call: %s\n", err)
 			return
 		}
-		if string(getReply.Value) != string(value) {
-			t.Errorf("RecvGet returned unexpected value: %s | Expected: %s\n", string(getReply.Value), string(value))
+		if string(getReply.Value) != string(putArgs.Value) {
+			t.Errorf("RecvGet returned unexpected value: %s | Expected: %s | Key: %s\n", string(getReply.Value), string(putArgs.Value), putArgs.Key)
 			return
 		}
 	}
@@ -409,9 +416,12 @@ func testRPCSequentially(t *testing.T, name string, numMessages int) {
 }
 
 func testRPCConcurrently(t *testing.T, name string, numClients, numMessages int) {
+	testTimeout := 10
+	clientTimeout := 5
+	defaultBufferSize := 20000
+	valueLength := 8
+
 	syscall.Getrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: 64000, Max: 64000})
-	rand.Seed(time.Now().UnixNano())
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 	fmt.Printf("========== %s: %d client(s), %d get requests each ==========\n", name, numClients, numMessages)
 
 	ts := newTestSystem(t)
@@ -424,7 +434,8 @@ func testRPCConcurrently(t *testing.T, name string, numClients, numMessages int)
 
 	fmt.Printf("Calling RecvPut RPC %d times for %d clients concurrently...\n", numMessages, numClients)
 	fmt.Printf("Calling RecvGet RPC %d times for %d clients concurrently...\n", numMessages, numClients)
-	clientTracker := make(chan bool, 10000)
+
+	clientTracker := make(chan bool, defaultBufferSize)
 	for i := 1; i < 1+numClients; i++ {
 		go func(clientID int) {
 			server, err := rpc.DialHTTP("tcp", "localhost:"+strconv.Itoa(port))
@@ -435,41 +446,49 @@ func testRPCConcurrently(t *testing.T, name string, numClients, numMessages int)
 			}
 			defer server.Close()
 
-			done := make(chan *rpc.Call, 10000)
-			tracker := make(map[string][]byte)
+			tracker := make(map[string][]byte, defaultBufferSize)
+			done := make(chan *rpc.Call, defaultBufferSize)
+			sendGet := make(chan bool, defaultBufferSize)
 
 			for j := 0; j < numMessages; j++ {
 				putArgs := new(rpcs.PutArgs)
 				putReply := new(rpcs.PutReply)
-				value := make([]rune, 8)
-				for k := range value {
-					value[k] = letters[rand.Intn(len(letters))]
-				}
 				putArgs.Key = "Test" + strconv.Itoa((100000*clientID)+j)
-				putArgs.Value = []byte(string(value))
+				putArgs.Value = randomValueGen(valueLength)
 				tracker[putArgs.Key] = putArgs.Value
 				server.Go("KeyValueServer.RecvPut", putArgs, putReply, done)
 			}
 
-			time.Sleep(5 * time.Second)
+			go func() {
+				ready := <-sendGet
+				if ready {
+					for j := 0; j < numMessages; j++ {
+						getArgs := new(rpcs.GetArgs)
+						getReply := new(rpcs.GetReply)
+						getArgs.Key = "Test" + strconv.Itoa((100000*clientID)+j)
+						server.Go("KeyValueServer.RecvGet", getArgs, getReply, done)
+					}
+				}
 
-			for j := 0; j < numMessages; j++ {
-				getArgs := new(rpcs.GetArgs)
-				getReply := new(rpcs.GetReply)
-				getArgs.Key = "Test" + strconv.Itoa(j)
-				server.Go("KeyValueServer.RecvGet", getArgs, getReply, done)
-			}
+			}()
 
-			count := 0
+			putCount := 0
+			getCount := 0
 			for {
 				select {
-				case <-time.After(15 * time.Second):
+				case <-time.After(time.Duration(clientTimeout) * time.Second):
 					t.Errorf("Test timed out: client waited too long for RPC replies")
+					if putCount != numMessages {
+						sendGet <- false
+					}
 					clientTracker <- false
 					return
 				case call := <-done:
 					if call.Error != nil {
 						t.Errorf("RPC-call returned an error: %s\n", err)
+						if putCount != numMessages {
+							sendGet <- false
+						}
 						clientTracker <- false
 						return
 					}
@@ -477,8 +496,8 @@ func testRPCConcurrently(t *testing.T, name string, numClients, numMessages int)
 						args := call.Args.(*rpcs.GetArgs)
 						reply := call.Reply.(*rpcs.GetReply)
 						if string(reply.Value) == string(tracker[args.Key]) {
-							count++
-							if count == numMessages {
+							getCount++
+							if getCount == numMessages {
 								clientTracker <- true
 								return
 							}
@@ -487,25 +506,26 @@ func testRPCConcurrently(t *testing.T, name string, numClients, numMessages int)
 							clientTracker <- false
 							return
 						}
+					} else {
+						putCount++
+						if putCount == numMessages {
+							sendGet <- true
+						}
 					}
 				}
 			}
 		}(i)
 	}
 
-	clientCount := 0
+	numResponses := 0
 	for {
 		select {
-		case <-time.After(40 * time.Second):
+		case <-time.After(time.Duration(testTimeout) * time.Second):
 			t.Errorf("Test timed out")
 			return
-		case result := <-clientTracker:
-			if result {
-				clientCount++
-				if clientCount == numClients {
-					return
-				}
-			} else {
+		case <-clientTracker:
+			numResponses++
+			if numResponses == numClients {
 				return
 			}
 		}
@@ -542,6 +562,7 @@ func testBasic(t *testing.T, name string, numClients, numMessages, timeout int) 
 		t.Error(err)
 		return
 	}
+
 	if err := ts.runTest(numMessages, timeout, allClients, []*testClient{}, 0); err != nil {
 		t.Error(err)
 		return

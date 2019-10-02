@@ -4,89 +4,114 @@ package pa1
 
 import (
 	"DS_PA1/rpcs"
-	"fmt"
+	// "fmt"
 	"net"
 	"bufio"
 	"strconv"
 )
 
 type keyValueServer struct {
-	// TODO: implement this!
-	totalConnections int
-	socketList []net.Conn
-	read chan string
-	write chan string
-	writeToClient chan string
 	listener net.Listener
+	clientList map[int] *client
+	connectedClients int
+	addNewClient chan net.Conn
+	closeServer chan bool
+	countYesNo chan bool
+	sendingCount chan int
+	deleteClient chan *client
+	msgFromClient chan *node
+	temp chan bool
+}
 
+type node struct {
+	msg string
+	id int
+}
+
+type client struct {
+	id int
+	conn net.Conn
+	kvs *keyValueServer
+	responseFromServer chan string
+	stopWriting chan bool
 }
 
 // New creates and returns (but does not start) a new KeyValueServer.
 func New() KeyValueServer {
-	server := new(keyValueServer)
-	server.read = make(chan string)
-	server.write = make(chan string)
-	server.writeToClient = make(chan string)
+	server := &keyValueServer{
+		clientList:         make(map[int]*client),
+		connectedClients: -1,
+		addNewClient:      make(chan net.Conn),
+		closeServer:     make(chan bool),
+		countYesNo:    make(chan bool),
+		sendingCount:   make(chan int),
+		deleteClient:           make(chan *client),
+		msgFromClient:              make(chan *node)}
+
+	initDB()
 	return server
 }
 
 func (kvs *keyValueServer) StartModel1(port int) error {
-	// attempt to listen on port 9999
 	ln, err := net.Listen("tcp", ":" + strconv.Itoa(port))
 	kvs.listener = ln
-	// print error and return if couldn't listen on port 999
 	if err != nil {
-		fmt.Printf("Couldn't listen on port 9999: %s\n", err)
 		return nil
 	}
 
-	// listen forever
-	//fmt.Println("Server has started....")
-	
-	initDB()
+	go serverHandlingClients(kvs)
+
 	go func() {
 		for {
-			//fmt.Println("Connected Clients: ",kvs.totalConnections)
 			conn, err := ln.Accept()
-			kvs.socketList = append(kvs.socketList,conn)
-			kvs.totalConnections++
-			//fmt.Println("Client",kvs.totalConnections ,"has been connected...")
-			
-			// handle successful connections concurrently
 			if err != nil {
-				//fmt.Printf("Couldn't accept a client connection: %s\n", err)
-				break
-			} else {
-				go readWriteToClient(conn,kvs)
+				continue
 			}
+			kvs.addNewClient <- conn
 		}
 	}()
-	go readWriteInDataBase(kvs)
-	//ln.Close()
 	return nil
 }
 
 func (kvs *keyValueServer) Close() {
 	// TODO: implement this!
-	kvs.listener.Close()
+	kvs.closeServer <- true
 }
 
 func (kvs *keyValueServer) Count() int {
-	// TODO: implement this! for first deadline
-	return kvs.totalConnections
+	kvs.countYesNo <- true
+	return <- kvs.sendingCount
 }
 
 func (kvs *keyValueServer) StartModel2(port int) error {
-	// TODO: implement this!
-	//
-	// Do not forget to call rpcs.Wrap(...) on your kvs struct before
-	// passing it to <sv>.Register(...)
-	//
-	// Wrap ensures that only the desired methods (RecvGet and RecvPut)
-	// are available for RPC access. Other KeyValueServer functions
-	// such as Close(), StartModel1(), etc. are forbidden for RPCs.
-	//
-	// Example: <sv>.Register(rpcs.Wrap(kvs))
+	
+	go func() {
+	// The methods of this class will be made available for RPC access
+
+	// Attempt to listen on TCP port 9999
+	ln, err := net.Listen("tcp", "localhost:9999")
+
+	// Print error and return if couldn't listen on port 9999
+	if err != nil {
+		fmt.Println("Couldn't listen on port 9999: ", err)
+		return
+	}
+
+	// Instantiate a new RPC server object
+	rpcServer := rpc.NewServer()
+
+	// Register Server class methods for RPC access
+	http.DefaultServeMux = http.NewServeMux()
+	// Register an HTTP handler for the RPC server
+	rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
+
+	// Start a go-routine that listens for RPC calls on the TCP listener ln forever
+	go http.Serve(ln, nil)
+
+	//  code...
+	// Block main forever
+	fmt.Println("RPC server started...")
+	}()
 	return nil
 }
 
@@ -101,62 +126,112 @@ func (kvs *keyValueServer) RecvPut(args *rpcs.PutArgs, reply *rpcs.PutReply) err
 }
 
 // TODO: add additional methods/functions below!
-
-// handleConnection handles client connections
-
-func readWriteInDataBase(kvs *keyValueServer) {
+func serverHandlingClients(kvs *keyValueServer) {
 	for {
 		select {
-			case msg1 := <- kvs.write:
-				key := msg1[:check(msg1)]
-				value := msg1[check(msg1)+1:]
-				put(key,[]byte(value)) // write command
-				//fmt.Println("Value Put -> Key: ",key," Value: ",string(value))
-
-			case key := <- kvs.read:
-				v := get(key) // read command
-				//fmt.Println("Value Get -> Key: ",key, "Value: ",string(v))
-				kvs.writeToClient <- key + "," + string(v)
-				
+		// case to add a new client to map
+		case conn := <-kvs.addNewClient:
+			newClientHandler(conn,kvs)
+		// read message from client
+		case message := <- kvs.msgFromClient:
+			msgFromClientHandler(message,kvs)
+		// remove the client because client is not online anymore
+		case newClient := <- kvs.deleteClient:
+			newClient.stopWriting <- true
+			delete(kvs.clientList,newClient.id)
+		// sends total count back to Count()
+		case <- kvs.countYesNo:
+			length := len(kvs.clientList)
+			kvs.sendingCount <- length
+		// close whole server
+		case <- kvs.closeServer:
+			for _,client := range kvs.clientList {
+				client.conn.Close()
+				client.stopWriting <-true
+			}
+			kvs.listener.Close()
+			return 
 		}
 	}
 }
 
-func readWriteToClient(conn net.Conn,kvs *keyValueServer) {
-	go readingFromClient(conn,kvs)
-	go writingToCLient(conn,kvs)
-	
+func newClientHandler(conn net.Conn,kvs *keyValueServer) {
+	newId := kvs.connectedClients + 1
+	kvs.connectedClients = newId
+
+	newClient := &client{
+		id: kvs.connectedClients,
+		conn: conn,
+		kvs: kvs,
+		responseFromServer: make(chan string,500),
+		stopWriting: make(chan bool)}
+	go clientReadHandler(newClient)
+	go clientWriteHandler(newClient)
+	_, ok := kvs.clientList[newId]
+	if !ok {
+		kvs.clientList[newId] = newClient
+	}
 }
-func writingToCLient(conn net.Conn,kvs *keyValueServer) {
-	for {
-			msg := <- kvs.writeToClient
-			for _,socket := range kvs.socketList {
-				socket.Write([]byte(msg))
+
+func msgFromClientHandler(message *node, kvs *keyValueServer) {
+	command,key,value := parsingData(message.msg)
+	if command == "put" {
+		put(key,[]byte(value)) // write command
+		// fmt.Println("Value Put -> Key: ",key," Value: ",string(value))
+	}
+	if command == "get" {
+		v := get(key)
+		// fmt.Println("Value Get -> Key: ",key, "Value: ",string(v))
+		finalText := key + "," + string(v)
+		
+		for _, client := range kvs.clientList {
+			select {
+			case client.responseFromServer <- finalText:
+			default:
+				break
 			}
+			// client.conn.Write([]byte(finalText))			
 		}
+	}
 }
-func readingFromClient(conn net.Conn,kvs *keyValueServer) {
-	// clean up once the connection closes
-	defer Clean(conn)
-	// obtain a buffered reader / writer on the connection
-	rw := ConnectionToRW(conn)
+
+
+
+func clientReadHandler(newClient *client) {
+	defer Clean(newClient.conn)
+
+	rw := ConnectionToRW(newClient.conn)
 	for {
 		msg, err := rw.ReadString('\n') 
 		if err != nil {
-			//fmt.Printf("There was an error reading from a client connection: %s\n", err)
-			kvs.totalConnections--
-			//fmt.Println("Connected Clients: ",kvs.totalConnections)
+			// close socket as well
+			newClient.conn.Close()
+			newClient.kvs.deleteClient <- newClient
 			return
 		}
-		command,key,value := parsingData(msg)
-		// fmt.Println(command,key,value)
-		if command == "put" {
-			kvs.write <- key + "," + string(value)
-		} else if command == "get" {
-			kvs.read <- key
+		id := newClient.id
+		message := & node{
+			msg: msg,
+			id: id}
+		newClient.kvs.msgFromClient <- message
+	}
+}
+
+func clientWriteHandler(newClient *client) {
+	defer Clean(newClient.conn)
+
+	rw := ConnectionToRW(newClient.conn)
+	for {
+		select {
+		case <- newClient.stopWriting:
+			return
+		case data := <- newClient.responseFromServer:
+			rw.WriteString(data)
+			rw.Flush()
 		}
 	}
 }
+
 // Clean closes a connection
 func Clean(conn net.Conn) {
 	// clean up connection related data structures and goroutines here
