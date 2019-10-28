@@ -12,5 +12,5 @@ When client sends a get command, it will send key as well and server in reply wi
 
 Server will also allow concurent read writes. which is handled all perfectly in the project.
 
-##Technologies Used
+## Technologies Used
 Go-Lang
